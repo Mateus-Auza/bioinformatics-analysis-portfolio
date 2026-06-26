@@ -151,7 +151,7 @@ The report automatically loads the **pasilla** dataset from the installed Biocon
 
 *Comparison of differential expression results between the adjusted and unadjusted models.*
 
-![Volcano Plot](figures/volcano.png)
+![Volcano Plot](figures/volcano-plot.png)
 
 ---
 
@@ -159,7 +159,7 @@ The report automatically loads the **pasilla** dataset from the installed Biocon
 
 *Adjusted model reduces technical noise and removes low-count artifacts.*
 
-![MA Plot](figures/ma-plot.png)
+![MA Plot](figures/ma-plots.png)
 
 ---
 
