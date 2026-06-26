@@ -2,6 +2,10 @@
 
 This repository contains an exploratory metagenomics analysis of vaginal microbiome data from the **ISALA citizen science project**. Using **16S rRNA sequencing** data, the project investigates microbial diversity and identifies groups of individuals with similar vaginal microbiota compositions through ordination and clustering techniques.
 
+# Author:
+
+**Mateus Auza Cruz & Dorian Napolitano**
+
 ## Repository Structure
 
 ```text
