@@ -1,0 +1,514 @@
+---
+title: "Mini-Project 3 : Analysis of bulk RNA-seq"
+author: "Dorian Napolitano & Mateus Auza Cruz"
+date: today 
+format: 
+  html:
+    code-fold: true
+    toc: true
+    toc-location: left
+    theme: lumen
+    number-sections: true
+    embed-resources: true
+execute:
+  cache: false 
+  warning: false
+project:
+  execute-dir: project
+editor: 
+  markdown: 
+    wrap: 80
+---
+```{r}
+#| message: false
+#| warning: false
+#| include: false
+#| label: packages
+library(tidyverse)
+library(magrittr)
+library(gt)
+library(ggrepel)
+library(patchwork)
+library(DESeq2)
+library(pasilla)
+library(pheatmap)
+```
+# Introduction 
+
+This report presents a differential expression analysis of bulk RNA-seq data to identify genes affected by the knockdown of the pasilla gene in Drosophila melanogaster. 
+
+A primary statistical challenge in this dataset is addressing the potential confounding effect of the sequencing protocol, single-end versus paired-end.
+
+To evaluate this, we will implement and compare two negative binomial generalized linear models using the DESeq2 framework: an unadjusted model assessing only the treatment effect, and an adjusted model controlling for the sequencing type. 
+
+By comparing the size factors, differentially expressed genes, and $p$-value distributions of both models, we aim to determine the optimal strategy for isolating the true biological signal.
+
+# Data Loading and Preprocessing
+In this section, we extract the raw count matrix and the corresponding sample metadata from the `pasilla` package, ensuring the reference levels are correctly specified for the experimental design.
+
+```{r}
+#| label: data-loading
+#| message: false
+
+data_path <- system.file("extdata/pasilla_gene_counts.tsv", package = "pasilla")
+metadata_path <- system.file("extdata/pasilla_sample_annotation.csv", package = "pasilla")
+
+cts <- as.matrix(read.table(data_path, header = TRUE, sep = "\t", row.names = "gene_id"))
+coldata <- read.csv(metadata_path, row.names = 1)
+
+colnames(cts) <- sub("fb", "", colnames(cts))
+rownames(coldata) <- sub("fb", "", rownames(coldata))
+
+coldata <- coldata[colnames(cts), ]
+
+coldata$condition <- factor(coldata$condition, levels = c("untreated", "treated"))
+coldata$type <- factor(coldata$type)
+```
+
+# Exploratory Data Analysis
+Before proceeding with differential expression, it is essential to characterize the dataset's structure and evaluate the global distribution of sequencing counts.
+
+## Dataset Dimensions and Experimental Design
+The dataset consists of a count matrix containing gene-level estimations and a metadata table describing the experimental conditions.
+```{r}
+#| label: dimensions
+#| echo: true
+
+n_genes <- nrow(cts)
+n_samples <- ncol(cts)
+
+cat("The dataset contains", n_genes, "genes sequenced across", n_samples, "samples.\n")
+
+table(Condition = coldata$condition, Type = coldata$type) %>%
+  as.data.frame() %>%
+  pivot_wider(names_from = Type, values_from = Freq) %>%
+  gt() %>%
+  tab_header(title = "Sample Distribution by Factor")
+```
+The table outlines the distribution of the seven biological samples according to their treatment condition and sequencing type. 
+
+The untreated control group consists of four samples, evenly split between two paired-end and two single-read replicates. 
+
+The treated group comprises three samples in total, consisting of two paired-end replicates and one single-read replicate.
+
+## Descriptive Statistics of Sequencing Depth
+To ensure that the sequencing effort is comparable across groups, we calculate the total number of reads per sample and summarize these metrics by experimental condition.
+
+```{r}
+#| label: descriptive-stats
+#| echo: true
+
+lib_sizes <- colSums(cts) / 1000000 # in millions
+
+
+coldata %>%
+  mutate(LibrarySize_M = lib_sizes) %>%
+  group_by(condition, type) %>%
+  summarise(
+    N = n(),
+    Mean_LibSize = mean(LibrarySize_M),
+    SD_LibSize = sd(LibrarySize_M),
+    .groups = "drop"
+  ) %>%
+  gt() %>%
+  fmt_number(columns = contains("LibSize"), decimals = 2) %>%
+  tab_header(title = "Summary Statistics of Library Sizes (Millions of Reads)")
+```
+The summary statistics reveal a substantial discrepancy in sequencing depth explicitly tied to the sequencing protocol. Single-read libraries were sequenced almost twice as deeply, averaging approximately 18 million reads, compared to paired-end libraries, averaging roughly 9.5 million reads, irrespective of the biological treatment.
+
+## Global Distribution of Gene Expression
+We visualize the distribution of counts using a $\log_{10}$ transformation with a pseudocount of 1 to avoid $\log_{10}(0)$. This allows for a direct comparison of the dynamic range across samples and groups.
+
+```{r}
+#| label: eda-boxplot
+#| fig.width: 9
+#| fig.height: 5
+log_cts_long <- as.data.frame(log10(cts + 1)) %>%
+  rownames_to_column("Gene") %>%
+  pivot_longer(-Gene, names_to = "Sample", values_to = "Log10_Counts") %>%
+  left_join(coldata %>% rownames_to_column("Sample"), by = "Sample")
+
+ggplot(log_cts_long, aes(x = Sample, y = Log10_Counts, fill = type)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Log-Transformed Gene Counts",
+    y = expression(log[10](Counts + 1)),
+    x = "Samples",
+    fill = "Sequencing Type"
+  ) +
+  scale_fill_manual(values = c("single-read" = "#CC79A7", "paired-end" = "#009E73")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Consistent with the summary statistics, the visualization of the log-transformed count distributions visually confirms the impact of the sequencing depth discrepancy. The single-read samples exhibit higher median counts and broader distributions inherently because their total library sizes are substantially larger.
+
+## Principal Component Analysis
+To identify the primary sources of variation in the transcriptomic data, we perform a PCA. We use the Variance Stabilizing Transformation (VST) to normalize the data while accounting for the mean-variance relationship of the negative binomial distribution.
+```{r}
+#| label: eda-pca
+#| fig.width: 8
+#| fig.height: 5
+
+dds_eda <- DESeqDataSetFromMatrix(countData = cts, 
+                                  colData = coldata, 
+                                  design = ~ 1)
+
+vsd <- vst(dds_eda, blind = FALSE)
+
+pca_data <- plotPCA(vsd, intgroup = c("condition", "type"), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition, shape = type)) +
+  geom_point(size = 5, alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "PCA: Principal Components of Transformed Gene Expression",
+    x = paste0("PC1: ", percentVar[1], "% variance"),
+    y = paste0("PC2: ", percentVar[2], "% variance"),
+    color = "Condition",
+    shape = "Sequencing Type"
+  ) +
+  scale_color_manual(values = c("untreated" = "#56B4E9", "treated" = "#E69F00"))
+```
+Crucially, PC2 strictly segregates the samples according to their sequencing protocol. Together with the depth disparities and distributional shifts observed previously, this orthogonal separation confirms the presence of a massive technical batch effect. The magnitude of this variance dictates our downstream modeling strategy: it is statistically imperative to include the sequencing type as a blocking factor to absorb this noise and accurately isolate the biological signal.
+
+# Differential Expression Analysis
+
+To identify genes that are significantly differentially expressed upon pasilla knockdown, we utilize the `DESeq2` framework. This method models the raw RNA-seq counts using a negative binomial distribution to account for biological and technical overdispersion.
+
+Given the substantial technical batch effect identified during the exploratory data analysis, we will formulate and fit two distinct generalized linear models, an unajusted model and an ajusted one. 
+
+## Unadjusted Model: Treatment Effect Only
+In this first approach, we define a naive negative binomial model that strictly considers the biological condition as the sole explanatory variable. Any variance introduced by the sequencing protocol is not accounted for and is subsequently absorbed by the model's error term.
+```{r}
+#| label: model-unadjusted
+#| warning: false
+#| message: false
+
+dds_unadj <- DESeqDataSetFromMatrix(
+  countData = cts, 
+  colData = coldata, 
+  design = ~ condition
+)
+
+dds_unadj <- DESeq(dds_unadj)
+
+res_unadj <- results(dds_unadj, 
+                     contrast = c("condition", "treated", "untreated"), 
+                     alpha = 0.05)
+
+summary(res_unadj)
+```
+The unadjusted model provides a baseline estimation of differential expression, absorbing all unmodeled technical variation into its residual error.
+
+## Adjusted Model: Controlling for Sequencing Type
+
+Given the substantial batch effect identified during the exploratory phase, we formulate a second, adjusted model in which we explicitly include the sequencing protocol (single-read vs. paired-end) as a blocking factor. 
+
+This allows the model to estimate the effect of the pasilla knockdown while mathematically neutralizing the baseline differences in read counts caused by the sequencing technology.
+
+```{r}
+#| label: model-adjusted
+#| warning: false
+#| message: false
+
+dds_adj <- DESeqDataSetFromMatrix(
+  countData = cts, 
+  colData = coldata, 
+  design = ~ type + condition
+)
+
+dds_adj <- DESeq(dds_adj)
+
+res_adj <- results(dds_adj, 
+                   contrast = c("condition", "treated", "untreated"), 
+                   alpha = 0.05)
+
+summary(res_adj)
+```
+By capturing the technical variance associated with the sequencing type in the design matrix, this adjusted model aims to enhance sensitivity and specificity. A detailed comparative evaluation of both models is presented in the following section.
+
+## Comparison of the Two Analyses
+### Evaluation of Size Factors
+
+We first investigate whether the estimation of size factors, which corrects for differences in sequencing depth, differs between the unadjusted and adjusted models.
+```{r}
+#| label: compare-size-factors
+#| echo: true
+
+sf_unadj <- sizeFactors(dds_unadj)
+sf_adj <- sizeFactors(dds_adj)
+
+data.frame(
+  Sample = names(sf_unadj),
+  Unadjusted_Model = sf_unadj,
+  Adjusted_Model = sf_adj
+) %>%
+  gt() %>%
+  fmt_number(columns = c(Unadjusted_Model, Adjusted_Model), decimals = 4) %>%
+  tab_header(title = "Comparison of Size Factors Between Models")
+
+```
+As demonstrated, the size factors are strictly identical across both models. This confirms that the initial DESeq2 median-of-ratios normalization correctly captures the depth disparities (assigning factors $>1$ to the deeper single-read samples and $<1$ to paired-end samples) prior to, and independent of, the GLM design specification.
+
+### Number of Differentially Expressed Genes
+
+We now compare the number of genes identified as differentially expressed across both models.
+```{r}
+#| label: deg-comparison-table
+#| echo: true
+
+get_counts <- function(res) {
+  res_df <- as.data.frame(res)
+  up <- sum(res_df$padj < 0.05 & res_df$log2FoldChange > 0, na.rm = TRUE)
+  down <- sum(res_df$padj < 0.05 & res_df$log2FoldChange < 0, na.rm = TRUE)
+  return(c(Up_regulated = up, Down_regulated = down, Total = up + down))
+}
+
+deg_summary <- data.frame(
+  Model = c("Unadjusted (~ condition)", "Adjusted (~ type + condition)"),
+  rbind(get_counts(res_unadj), get_counts(res_adj))
+)
+
+deg_summary %>%
+  gt() %>%
+  tab_header(title = "Number of Differentially Expressed Genes") %>%
+  cols_label(Up_regulated = "Up-regulated", Down_regulated = "Down-regulated")
+```
+The table summarizes the differentially expressed genes (FDR < 0.05). The adjusted model detects substantially more significant genes (1,079 total) compared to the unadjusted model (838 total). This 28% increase clearly demonstrates the gain in statistical power achieved by accounting for the sequencing type, which effectively reduces the residual technical noise.
+
+### Analysis of Discordant Genes and False Positives
+
+To identify potential false positives caused by unmodeled batch effects, we compare the genes that are significantly differentially expressed in the unadjusted model with those in the adjusted model.
+
+The following code extracts the first `ten` genes that are significant in the unadjusted model but not in the adjusted model.
+
+```{r}
+#| label: significant-genes
+
+sig_unadj <- rownames(res_unadj)[which(res_unadj$padj < 0.05)]
+sig_adj <- rownames(res_adj)[which(res_adj$padj < 0.05)]
+
+false_positives <- setdiff(sig_unadj, sig_adj)
+false_positive_df <- data.frame(
+  t(head(false_positives, 10))
+)
+
+colnames(false_positive_df) <- paste0("Gene_", 1:10)
+
+false_positive_df %>%
+  gt() %>%
+  tab_header(title = "False Positive Genes")
+
+```
+
+
+To illustrate the consequence of unmodeled batch effects, we visualize the normalized expression of `FBgn0000826.`
+
+This gene represents a discordant finding: it was flagged as significantly differentially expressed by the unadjusted model but lost its significance upon covariate adjustment.
+
+```{r}
+#| label: discordant-genes
+#| fig.width: 8
+#| fig.height: 5
+
+
+
+top_fp <- false_positives[1] 
+
+plotCounts(dds_adj, gene = top_fp, intgroup = c("condition", "type"), returnData = TRUE) %>%
+  ggplot(aes(x = condition, y = count, color = type, shape = type)) +
+  geom_point(size = 4, position = position_jitter(w = 0.1, h = 0)) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = paste("Normalized Counts for Gene:", top_fp),
+    subtitle = "Significant in Unadjusted Model only",
+    y = "Normalized Counts (log10 scale)",
+    color = "Sequencing Type",
+    shape = "Sequencing Type"
+  ) +
+  scale_color_manual(values = c("single-read" = "#CC79A7", "paired-end" = "#009E73"))
+```
+While gaining overall power, the adjusted model also filters out technical artifacts. The gene FBgn0000826 perfectly illustrates this: flagged as significant by the unadjusted model, it loses significance upon adjustment. Visual inspection reveals why: the extreme variance within the treated group aligns perfectly with the sequencing protocol rather than a biological response. The unadjusted model conflates this technical discrepancy with a genuine treatment effect.
+
+```{r}
+#| label: additional-discordant-genes
+#| echo: true
+
+extra_examples <- false_positives[2:6]
+
+res_unadj[extra_examples, ] %>%
+  as.data.frame() %>%
+  dplyr::select(baseMean, log2FoldChange, pvalue, padj) %>%
+  gt(rownames_to_stub = TRUE) %>%
+  tab_header(
+    title = "Additional Examples of Discordant Genes",
+    subtitle = "Significant in Unadjusted Model, Non-Significant in Adjusted Model"
+  ) %>%
+  fmt_scientific(columns = c(pvalue, padj)) %>%
+  fmt_number(columns = log2FoldChange, decimals = 2)
+```
+This behavior is a systematic artifact of the unadjusted model. As shown above, genes with borderline p-values and low baseline expression are highly vulnerable to this unmodeled heteroscedasticity. By formally accounting for the sequencing type, the adjusted model correctly recognizes this variance as technical noise, dropping the false positives.
+
+#### Comparison of p-values
+
+To assess model calibration and compare statistical power, we examine the distribution of raw $p$-values across all tested genes.
+```{r}
+#| label: pvalue-histograms
+#| fig.width: 10
+#| fig.height: 5
+
+# Création d'un jeu de données combiné contenant les p-valeurs brutes (en retirant les NA)
+pval_df <- bind_rows(
+  data.frame(Model = "Unadjusted (~ condition)", P_value = res_unadj$pvalue),
+  data.frame(Model = "Adjusted (~ type + condition)", P_value = res_adj$pvalue)
+) %>% drop_na()
+
+# Tracé des histogrammes avec facettes
+ggplot(pval_df, aes(x = P_value, fill = Model)) +
+  geom_histogram(breaks = seq(0, 1, by = 0.025), color = "black", alpha = 0.7) +
+  facet_wrap(~ Model) +
+  theme_minimal() +
+  labs(
+    title = "Comparison of Raw p-value Distributions",
+    x = "Raw p-value",
+    y = "Frequency"
+  ) +
+  scale_fill_manual(values = c(
+    "Unadjusted (~ condition)" = "#56B4E9", 
+    "Adjusted (~ type + condition)" = "#E69F00"
+  )) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 12, face = "bold")
+  )
+```
+The raw $p$-value histograms visually confirm the power dynamics discussed above. Both models exhibit a theoretically valid structure (a uniform background under $H_0$ and a peak near zero under $H_1$). However, the adjusted model presents a markedly higher frequency in the $p < 0.05$ interval. This visual enrichment proves that reducing unexplained technical noise effectively shifts a greater number of $p$-values toward zero, increasing overall sensitivity.
+
+#### Volcano Plots: Effect Size vs. Significance
+The Volcano plot visualizes the relationship between the estimated biological effect ($\log_2(\text{Fold Change})$) and its statistical significance ($-\log_{10}(p\text{-value})$).
+```{r}
+#| label: volcano-plots
+#| fig.width: 10
+#| fig.height: 5
+#| warning: false
+
+df_volcano <- bind_rows(
+  as.data.frame(res_unadj) %>% mutate(Model = "Unadjusted (~ condition)"),
+  as.data.frame(res_adj) %>% mutate(Model = "Adjusted (~ type + condition)")
+) %>%
+  drop_na(padj, log2FoldChange, pvalue) %>%
+  mutate(Significance = ifelse(padj < 0.05, "Significant", "Not Significant"))
+
+ggplot(df_volcano, aes(x = log2FoldChange, y = -log10(pvalue), color = Significance)) +
+  geom_point(alpha = 0.5, size = 1) +
+  facet_wrap(~ Model) +
+  scale_color_manual(values = c("Not Significant" = "grey70", "Significant" = "#D55E00")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black", alpha = 0.3) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plots: Impact of Covariate Adjustment",
+    x = expression(log[2](Fold~Change)),
+    y = expression(-log[10](p-value))
+  ) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold", size = 11))
+```
+The Volcano plots illustrate exactly how this power gain manifests at the gene level. In the adjusted model, the distribution of significant genes experiences a pronounced vertical shift toward higher $-\log_{10}(p\text{-value})$ values. 
+
+The reduction in standard errors directly "lifts" a broader set of genes above the significance threshold compared to the unadjusted model, without requiring larger fold changes.
+
+
+#### Mean Expression vs. Fold Change
+
+The MA-plot evaluates the $\log_2(\text{Fold Change})$ as a function of the mean normalized counts ($\text{baseMean}$). It is a critical diagnostic tool for assessing heteroscedasticity and identifying expression-dependent biases.
+
+```{r}
+#| label: ma-plots
+#| fig.width: 10
+#| fig.height: 5
+#| warning: false
+
+ggplot(df_volcano, aes(x = baseMean, y = log2FoldChange, color = Significance)) +
+  geom_point(alpha = 0.5, size = 1) +
+  facet_wrap(~ Model) +
+  scale_x_log10() +
+  scale_color_manual(values = c("Not Significant" = "grey70", "Significant" = "#009E73")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "MA-Plots: Log-Fold Change vs. Mean Expression",
+    x = "Mean Normalized Counts (log scale)",
+    y = expression(log[2](Fold~Change))
+  ) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold", size = 11))
+```
+Both plots show global centering around $y = 0$, confirming proper size factor normalization. However, in the low-expression regime ($< 10^2$), the unadjusted model falsely flags numerous highly dispersed genes as significant due to unmodeled technical noise. The adjusted model effectively shrinks this batch-driven variance, filtering out these low-count artifacts and yielding a cleaner, biologically robust set of differentially expressed genes.
+
+
+## Differential Expression Driven by Sequencing Type
+
+To definitively quantify the magnitude of the technical batch effect, we isolate the type covariate from the adjusted model. We test for differential expression between single-read and paired-end protocols while strictly holding the biological condition constant.
+```{r}
+#| label: seq-type-effect
+#| echo: true
+
+res_type <- results(dds_adj, 
+                    contrast = c("type", "single-read", "paired-end"), 
+                    alpha = 0.05)
+
+summary(res_type)
+
+as.data.frame(res_type) %>%
+  drop_na(padj) %>%
+  summarise(
+    Significant_Genes = sum(padj < 0.05),
+    Up_in_SingleRead = sum(padj < 0.05 & log2FoldChange > 0),
+    Down_in_SingleRead = sum(padj < 0.05 & log2FoldChange < 0)
+  ) %>%
+  gt() %>%
+  tab_header(
+    title = "Genes Differentially Expressed by Sequencing Type",
+    subtitle = "Controlling for Biological Condition (FDR < 0.05)"
+  )
+```
+The contrast isolates 894 genes significantly differentially expressed ($FDR < 0.05$) solely due to the sequencing protocol. This massive technical signal—nearly comparable in magnitude to the biological treatment effect itself—proves that the library type is a major confounding factor. It definitively justifies the use of the adjusted model as a strict statistical necessity to regress out this batch effect and prevent severe bias in the biological inference.
+
+```{r}
+#| label: top_gene
+#| echo: true
+top_type_genes <- rownames(res_type[order(res_type$padj), ])
+
+top_tech_gene <- top_type_genes[1]
+```
+
+To concretely illustrate this phenomenon, we examine `r top_tech_gene`, the most statistically significant gene in the technical contrast.
+```{r}
+#| label: seq-type-examples
+#| fig.width: 8
+#| fig.height: 5
+#| echo: true
+
+plotCounts(dds_adj, gene = top_tech_gene, intgroup = c("type", "condition"), returnData = TRUE) %>%
+  ggplot(aes(x = type, y = count, color = condition, shape = condition)) +
+  geom_point(size = 4, position = position_jitter(w = 0.1, h = 0)) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = paste("Example of Technical Bias: Gene", top_tech_gene),
+    subtitle = "Counts perfectly segregate by sequencing type, not by biological condition",
+    x = "Sequencing Protocol",
+    y = "Normalized Counts (log10 scale)",
+    color = "Biological Condition",
+    shape = "Biological Condition"
+  ) +
+  scale_color_manual(values = c("untreated" = "#56B4E9", "treated" = "#E69F00"))
+```
+The plot clearly demonstrates that the expression of `r top_tech_gene` segregates strictly by sequencing protocol rather than biological condition. This visually confirms a pure technical batch effect, reinforcing the absolute necessity of the covariate adjustment to prevent flawed biological conclusions.
+
+# Conclusion : Optimal Analysis Strategy 
+
+The adjusted model, taking into account the condition and the type of sequencing protocol,  represents the most adequate strategy for this differential expression analysis. By formally incorporating the sequencing protocol as a blocking factor, it effectively decouples the biological signal from the substantial technical bias inherent in the experimental design.
+
+This approach successfully neutralizes the confounding effects of library types, ensuring both enhanced specificity through the reduction of technical false positives and maximized sensitivity via a significant gain in statistical power. Ultimately, this strategy provides the most robust and biologically relevant interpretation of the transcriptomic data.
