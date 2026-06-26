@@ -10,7 +10,7 @@ This repository contains three independent bioinformatics data analysis projects
 
 ### Contributors
 
-- **Dorian Napolitano** (Metagenomics project)
+- **Dorian Napolitano** (Metagenomics & transcriptomics project)
 
 ---
 
