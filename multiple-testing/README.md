@@ -71,6 +71,9 @@ The Benjamini–Hochberg procedure provides the best balance between statistical
 
 Shows the distribution of gene-wise p-values, with a strong enrichment near zero indicating substantial differential expression.
 
+![p-value-histogram](figures/p-value-histogram.png)
+
+
 ### Volcano Plot
 
 Displays log2 fold change versus −log10(p-value) for:
@@ -78,6 +81,9 @@ Displays log2 fold change versus −log10(p-value) for:
 - Raw p-values
 - Bonferroni-adjusted p-values
 - Benjamini–Hochberg-adjusted p-values
+
+![volcano-plot](figures/volcano-plot.png)
+
 
 ## Files
 
