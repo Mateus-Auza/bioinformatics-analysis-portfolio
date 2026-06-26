@@ -63,7 +63,7 @@ if (!require("BiocManager", quietly = TRUE))
     install.packages("BiocManager")
 
 BiocManager::install("SummarizedExperiment")
-gollub=readr::read_rds("Gollub_SE.rds")
+gollub=readr::read_rds("multiple-testing/Gollub_SE.rds")
 ```
 
 The dataset was loaded as a `SummarizedExperiment` object, a standard Bioconductor structure used to store omics data including:
