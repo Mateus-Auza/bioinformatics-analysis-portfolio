@@ -87,7 +87,7 @@ We load the dataset and inspect the structure of the object.
 #| output: false
 library(SummarizedExperiment)
 
-se = readRDS("isala_subset.Rds")
+se = readRDS("metagenomics/isala_subset.Rds")
 ```
 
 
